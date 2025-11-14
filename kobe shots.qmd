@@ -1,0 +1,64 @@
+---
+title: "Kobe Shot Selection"
+author: "Kelson Jensen"
+format: pdf
+editor: visual
+---
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(vroom)
+library(dplyr)
+library(tune)
+library(ggplot2)
+library(embed)
+library(doParallel)
+library(kknn)
+library(discrim)
+library(remotes)
+```
+
+# Upload data
+
+```{r}
+# Load your data
+df <- vroom("kobe-bryant-shot-selection/data.csv/data.csv",  delim = ",")
+
+# Split into training and test sets
+train <- df[!is.na(df$shot_made_flag), ]  # Training: where shot_made_flag is not NA
+test  <- df[is.na(df$shot_made_flag), ]   # Test: where shot_made_flag is NA
+
+# Check results
+nrow(train)
+nrow(test)
+
+```
+
+# Recipe
+
+```{r}
+
+
+my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
+  update_role(shot_id, game_id, team_id, new_role = "ID") %>%
+  step_rm(game_event_id, team_name, matchup, opponent, shot_id, game_id, team_id) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%          # <-- remove zero-variance columns (e.g., *_new)
+  # optional: also drop near-zero variance
+  # step_nzv(all_predictors()) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+
+
+
+
+shot_prep <- prep(my_recipe)
+train_ready <- juice(shot_prep)
+test_ready <- bake(shot_prep, new_data = test)
+```
