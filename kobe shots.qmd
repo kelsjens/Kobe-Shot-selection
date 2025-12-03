@@ -25,11 +25,17 @@ library(remotes)
 
 ```{r}
 # Load your data
-df <- vroom("kobe-bryant-shot-selection/data.csv/data.csv",  delim = ",")
+df <- vroom("C:/Users/User/OneDrive - Brigham Young University/Fall 2025/STAT 348/kobe-bryant-shot-selection/data.csv/data.csv",  delim = ",")
 
 # Split into training and test sets
 train <- df[!is.na(df$shot_made_flag), ]  # Training: where shot_made_flag is not NA
 test  <- df[is.na(df$shot_made_flag), ]   # Test: where shot_made_flag is NA
+
+train <- train %>%
+  mutate(
+    shot_made_flag = ifelse(shot_made_flag == 1, "made", "missed"),
+    shot_made_flag = factor(shot_made_flag, levels = c("missed", "made"))
+  )
 
 # Check results
 nrow(train)
@@ -41,7 +47,6 @@ nrow(test)
 
 ```{r}
 
-
 my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
   update_role(shot_id, game_id, team_id, new_role = "ID") %>%
   step_rm(game_event_id, team_name, matchup, opponent, shot_id, game_id, team_id) %>%
@@ -49,9 +54,7 @@ my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
   step_impute_mode(all_nominal_predictors()) %>%
   step_novel(all_nominal_predictors()) %>%
   step_dummy(all_nominal_predictors()) %>%
-  step_zv(all_predictors()) %>%          # <-- remove zero-variance columns (e.g., *_new)
-  # optional: also drop near-zero variance
-  # step_nzv(all_predictors()) %>%
+  step_zv(all_predictors()) %>%
   step_center(all_numeric_predictors()) %>%
   step_scale(all_numeric_predictors())
 
@@ -61,4 +64,63 @@ my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
 shot_prep <- prep(my_recipe)
 train_ready <- juice(shot_prep)
 test_ready <- bake(shot_prep, new_data = test)
+```
+
+# RF Model
+
+```{r}
+
+prep_obj <- prep(my_recipe)
+train_ready <- juice(prep_obj)
+
+# 4) RF model spec
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 200
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+# 5) Workflow
+rf_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(rf_spec)
+
+# 6) CV folds
+folds <- vfold_cv(train, v = 3, strata = shot_made_flag)
+
+# 7) Parameter ranges — THIS is the fix 👇
+rf_params <- parameters(
+  finalize(mtry(), train_ready),  # pass a 2D data frame, not a number
+  min_n()
+)
+
+rf_grid <- grid_regular(rf_params, levels = 5)
+
+# 8) Tune
+tuned <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+best_params <- select_best(tuned, "roc_auc")
+final_wf <- finalize_workflow(rf_wf, best_params)
+
+# 9) Fit on full training data
+final_fit <- fit(final_wf, data = train)
+
+# 10) Predict on test set (no shot_made_flag there)
+test_prob  <- predict(final_fit, new_data = test, type = "prob")
+test_class <- predict(final_fit, new_data = test, type = "class")
+
+test_preds <- bind_cols(
+  test %>% select(shot_id),
+  tibble(
+    prob_made = test_prob$.pred_made,
+    pred_flag = test_class$.pred_class
+  )
+)
 ```
