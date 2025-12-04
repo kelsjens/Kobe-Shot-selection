@@ -5,7 +5,15 @@ format: pdf
 editor: visual
 ---
 
-## Libraries
+# Intro
+
+This notebook builds machine learning models to predict whether Kobe Bryant made or missed each shot in the Kaggle *Kobe Bryant Shot Selection* competition. The goal is to use the rows that contain known shot outcomes to train several models and then generate predictions for the rows where the outcome is missing.
+
+The workflow includes importing the dataset, splitting into training and test sets, performing exploratory data analysis, engineering new basketball-motivated features, building multiple predictive models, and finally producing a submission file for Kaggle.
+
+### Libraries
+
+These are all of the libraries I needed throughout the document.
 
 ```{r}
 library(tidyverse)
@@ -15,13 +23,20 @@ library(dplyr)
 library(tune)
 library(ggplot2)
 library(embed)
-library(doParallel)
-library(kknn)
 library(discrim)
 library(remotes)
+library(xgboost)
 ```
 
-# Upload data
+### Upload data
+
+In this section, the original dataset is loaded and separated into two parts:
+
+-   The **training set** consists of rows where shot_made_flag is not missing.
+
+-   The **test set** consists of rows where shot_made_flag is missing and represents the data for which Kaggle expects predictions.
+
+The training data also recodes shot_made_flag into a factor with levels "missed" and "made" to support classification modeling.
 
 ```{r}
 # Load your data
@@ -43,25 +58,150 @@ nrow(test)
 
 ```
 
-# Recipe
+# EDA 
+
+Several visualizations are used to understand Kobe's shooting tendencies:
+
+-   Scatterplots of shot locations on the court using both lon/lat and loc_x/loc_y.
+
+-   A shot chart showing made and missed shots by location.
+
+-   Histograms showing the distribution of shot distances.
+
+-   A bar chart of the number of shots taken in each period.
+
+-   A bar chart of shot success proportions across different shot zone ranges.
+
+These plots help reveal spatial patterns in shot outcomes and motivate feature engineering decisions
 
 ```{r}
+kobe <- train
 
+ggplot(kobe, aes(x = lon, y = lat)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  labs(title = "Shot Locations (lon/lat)", x = "Longitude", y = "Latitude") +
+  theme_minimal()
+
+
+
+ggplot(kobe, aes(x = loc_x, y = loc_y, color = factor(shot_made_flag))) +
+  geom_point(alpha = 0.3) +
+  scale_color_manual(values = c("red", "green"), labels = c("Missed", "Made")) +
+  labs(title = "Shot Locations by Outcome", color = "Shot Made?") +
+  theme_minimal()
+
+
+ggplot(kobe, aes(x = shot_distance)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Shot Distances", x = "Distance (feet)", y = "Count") +
+  theme_minimal()
+
+
+ggplot(kobe, aes(x = period)) +
+  geom_bar(fill = "darkcyan") +
+  labs(title = "Shots by Game Period", x = "Period", y = "Number of Shots") +
+  theme_minimal()
+
+
+ggplot(kobe, aes(x = shot_zone_range, fill = factor(shot_made_flag))) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("red", "green"),
+                    labels = c("Missed", "Made")) +
+  labs(title = "Shot Accuracy by Shot Zone Range", 
+       x = "Zone Range", y = "Success Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+# Recipe
+
+To improve model performance, several new variables are created based on basketball context and court geometry.
+
+Key engineered features include:
+
+-    **Home vs Away:** Determined from whether the matchup string contains "vs.".
+
+-    **Season short code:** Extracted from the season range (e.g., "2009-10" → 0).
+
+-    **Game year:** Extracted from the game date.
+
+-    **Game number:** A numeric version of game_date used to model trends over time.
+
+-    **Post-Achilles injury indicator:** Whether the shot occurred after Kobe’s Achilles injury.
+
+-    **MVP period indicator:** Whether it occurred during a chosen MVP-related window.
+
+-    **Time remaining in the period:** Total seconds left when the shot was taken.
+
+-   **Polar coordinates:**
+
+    -    Shot distance computed from loc_x and loc_y.
+
+    -    Shot angle using atan2 to correctly capture shooting direction.
+
+The recipe also handles missing values, converts categorical variables to dummy variables, removes zero-variance predictors, and standardizes numeric predictors.
+
+```{r}
 my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
   # IDs
   update_role(shot_id, game_id, team_id, new_role = "ID") %>%
   
-  # Remove known non-predictive columns
-  step_rm(game_event_id, team_name, matchup, opponent, shot_id, game_id, team_id) %>%
-  
-  # --- Safe feature engineering ---
+  # ---------------------------------------------------------
+  # FEATURE ENGINEERING (your additions)
+  # ---------------------------------------------------------
   step_mutate(
+    # Home vs Away
+    home = ifelse(grepl("vs\\.", matchup), "Home", "Away"),
+    
+    # Season short (last digit of second part)
+    season_short = as.integer(substr(sub(".*-", "", season), 2, 2)),
+    
+    # Game year
     game_year = as.integer(substr(game_date, 1, 4)),
-    time_remaining = minutes_remaining * 60 + seconds_remaining
+    
+    # Numeric game index for time ordering
+    game_num = as.numeric(as.Date(game_date)),
+    
+    # Seconds remaining in the period
+    time_remaining = minutes_remaining * 60 + seconds_remaining,
+    
+    # Period to factor
+    period = factor(period)
   ) %>%
-  step_rm(game_date) %>%   # remove raw date (it would produce useless dummies)
   
-  # --- Original recipe pieces that worked ---
+  # Achilles and MVP indicators
+  step_mutate(
+    postachilles = ifelse(game_num > 1452, 1, 0),
+    mvp         = ifelse(game_num >= 909 & game_num <= 990, 1, 0)
+  ) %>% 
+  
+  # ---------------------------------------------------------
+  # POLAR COORDINATES FOR SHOOTING LOCATION
+  # ---------------------------------------------------------
+  step_mutate(
+    shot_distance = sqrt((loc_x / 10)^2 + (loc_y / 10)^2),
+    
+    # Safe angle computation: atan2 handles loc_x = 0 case automatically
+    angle = atan2(loc_y, loc_x)
+  ) %>%
+  
+  # Drop raw columns we replaced
+  step_rm(
+    game_event_id,
+    team_name,
+    matchup,
+    opponent,
+    shot_id,
+    game_id,
+    team_id,
+    game_date,
+    season
+  ) %>%
+  
+  # ---------------------------------------------------------
+  # ORIGINAL RECIPE STEPS (these worked best for you)
+  # ---------------------------------------------------------
   step_impute_mean(all_numeric_predictors()) %>%
   step_impute_mode(all_nominal_predictors()) %>%
   step_novel(all_nominal_predictors()) %>%
@@ -72,23 +212,30 @@ my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
 
 
 
+
 shot_prep <- prep(my_recipe)
 train_ready <- juice(shot_prep)
 test_ready <- bake(shot_prep, new_data = test)
 ```
 
-# RF Model
+# RF Model (Tuned)
+
+A random forest classifier is built using the engineered features.\
+Two hyperparameters are tuned using cross-validation:
+
+-    mtry: Number of predictors sampled at each split.
+
+-    min_n: Minimum observations required in each terminal node.
+
+A small regular grid is used to keep computation light.\
+The best model is selected based on ROC AUC.\
+The tuned model is then fit to the entire training set and used to generate predictions for the test set.
 
 ```{r}
-
-prep_obj <- prep(my_recipe)
-train_ready <- juice(prep_obj)
-
-# 4) RF model spec
 rf_spec <- rand_forest(
   mtry  = tune(),
   min_n = tune(),
-  trees = 500
+  trees = 500          # fixed number of trees (no tuning)
 ) %>%
   set_mode("classification") %>%
   set_engine("ranger", importance = "impurity")
@@ -98,32 +245,35 @@ rf_wf <- workflow() %>%
   add_recipe(my_recipe) %>%
   add_model(rf_spec)
 
-# 6) CV folds
+# 6) CV folds (small to keep it light)
 folds <- vfold_cv(train, v = 3, strata = shot_made_flag)
 
-# 7) Parameter ranges
-rf_params <- parameters(
-  finalize(mtry(), train_ready),  # pass a 2D data frame, not a number
-  min_n()
-)
+# 7) Simple tuning grid for mtry & min_n
+mtry_range  <- finalize(mtry(), train_ready)              # based on processed predictors
+min_n_range <- min_n(range = c(5L, 20L))                  # small nodes
 
-rf_grid <- grid_regular(rf_params, levels = 3)
+rf_grid <- grid_regular(
+  mtry_range,
+  min_n_range,
+  levels = 3           # 3 x 3 = 9 combos => cheap
+)
 
 # 8) Tune
-tuned <- tune_grid(
+tuned_rf <- tune_grid(
   rf_wf,
   resamples = folds,
-  grid = rf_grid,
-  metrics = metric_set(roc_auc, accuracy)
+  grid      = rf_grid,
+  metrics   = metric_set(roc_auc, accuracy)
 )
 
-best_params <- select_best(tuned, "roc_auc")
-final_wf <- finalize_workflow(rf_wf, best_params)
+best_rf <- select_best(tuned_rf, metric = "roc_auc")
 
-# 9) Fit on full training data
-final_fit <- fit(final_wf, data = train)
+final_rf_wf <- finalize_workflow(rf_wf, best_rf)
 
-# 10) Predict on test set (no shot_made_flag there)
+# 9) Fit tuned RF on full training data
+final_fit <- fit(final_rf_wf, data = train)
+
+# 10) Predict on test set (no shot_made_flag in test)
 test_prob  <- predict(final_fit, new_data = test, type = "prob")
 test_class <- predict(final_fit, new_data = test, type = "class")
 
@@ -134,15 +284,27 @@ test_preds <- bind_cols(
     pred_flag = test_class$.pred_class
   )
 )
+
+# 11) Submission file
+submission <- test_preds %>%
+  transmute(
+    shot_id,
+    shot_made_flag = prob_made
+  )
+
+write.csv(submission, "kobe-submission-tuned-simple-rf.csv", row.names = FALSE)
 ```
 
-# RF Not tuned
+# RF Model Not tuned
+
+A baseline random forest model is also fit without tuning to compare against the tuned version.
+Here, fixed values of mtry, min_n, and trees are chosen manually. The model is trained on the full training data and used to produce predictions for the test set.
 
 ```{r}
 rf_spec <- rand_forest(
   mtry  = 10,   # example: 20 predictors tried at each split
-  min_n = 5,    # example: minimum 5 observations per terminal node
-  trees = 1000   # number of trees
+  min_n = 8,    # example: minimum 5 observations per terminal node
+  trees = 500   # number of trees
 ) %>%
   set_mode("classification") %>%
   set_engine("ranger", importance = "impurity")
@@ -177,3 +339,147 @@ submission <- test_preds %>%
 write.csv(submission, "kobe-submission.csv", row.names = FALSE)
 
 ```
+
+# Penalized regression 
+
+A penalized logistic regression model is built using glmnet.\
+Two parameters are tuned:
+
+-    penalty: Controls overall regularization strength.
+
+-    mixture: Controls the blend between ridge regression (0), lasso (1), or elastic net (between).
+
+A regular grid over both parameters is evaluated using cross-validation.\
+The best model is finalized and used to generate predictions.
+
+This model provides an interpretable linear alternative to the tree-based models.
+
+```{r}
+log_spec <- logistic_reg(
+  penalty = tune(),   # lambda
+  mixture = tune()    # 0 = ridge, 1 = lasso, in between = elastic net
+) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+log_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(log_spec)
+
+# 4) Cross-validation + tuning grid
+folds <- vfold_cv(train, v = 5, strata = shot_made_flag)
+
+log_grid <- grid_regular(
+  penalty(range = c(-4, 1)),   # 10^-4 to 10^1
+  mixture(range = c(0, 1)),    # ridge -> elastic -> lasso
+  levels = 7
+)
+
+tuned_log <- tune_grid(
+  log_wf,
+  resamples = folds,
+  grid = log_grid,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# 🔧 FIX IS HERE
+best_log <- select_best(tuned_log, metric = "roc_auc")
+
+final_log_wf <- finalize_workflow(log_wf, best_log)
+
+# 5) Fit final model
+final_log_fit <- fit(final_log_wf, data = train)
+
+# 6) Predict on test (no shot_made_flag in `test`)
+test_prob  <- predict(final_log_fit, new_data = test, type = "prob")
+test_class <- predict(final_log_fit, new_data = test, type = "class")
+
+test_preds <- bind_cols(
+  test %>% select(shot_id),
+  tibble(
+    prob_made = test_prob$.pred_made,
+    pred_flag = test_class$.pred_class
+  )
+)
+
+# 7) Optional: submission file
+submission <- test_preds %>%
+  transmute(
+    shot_id,
+    shot_made_flag = prob_made
+  )
+
+write.csv(submission, "submission_glmnet.csv", row.names = FALSE)
+```
+
+# XGboost model
+
+An XGBoost gradient boosted tree model is trained using the engineered features. A simple but effective configuration is used rather than a full hyperparameter search:
+
+-    1000 trees
+
+-    Tree depth of 6
+
+-    Learning rate of 0.05
+
+-    Row sampling of 0.8
+
+-    Feature sampling (mtry) of 0.8, treated as a proportion
+
+XGBoost often performs well on structured tabular data, and this model is used to generate final predictions for the competition.
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = 6,
+  min_n = 10,
+  learn_rate = 0.05,
+  loss_reduction = 0,
+  sample_size = 0.8,   # row subsampling
+  mtry = 0.8           # feature subsampling (proportion)
+) %>%
+  set_engine("xgboost", counts = FALSE) %>%   # <-- FIX HERE
+  set_mode("classification")
+
+xgb_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(xgb_spec)
+
+xgb_fit <- fit(xgb_wf, data = train)
+
+test_prob  <- predict(xgb_fit, new_data = test, type = "prob")
+test_class <- predict(xgb_fit, new_data = test, type = "class")
+
+test_preds <- bind_cols(
+  test %>% select(shot_id),
+  tibble(
+    prob_made = test_prob$.pred_made,
+    pred_flag = test_class$.pred_class
+  )
+)
+
+submission <- test_preds %>%
+  transmute(
+    shot_id,
+    shot_made_flag = prob_made
+  )
+
+write.csv(submission, "kobe-xgboost-simple.csv", row.names = FALSE)
+```
+
+### Prediction generation
+
+Each model generates predicted class probabilities for the test set.\
+A submission file is created by selecting:
+
+-    shot_id
+
+-    The corresponding predicted probability of shot_made_flag = "made"
+
+The file is written as a CSV and uploaded to Kaggle for scoring.
+
+# Conclusion
+
+This notebook explored several modeling techniques for predicting shot outcomes in the Kobe Bryant dataset.\
+Through EDA, feature engineering, random forest models, penalized regression, and XGBoost, we built and compared multiple approaches.\
+The final output is a set of predictions formatted for submission to the Kaggle competition.
