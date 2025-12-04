@@ -144,78 +144,135 @@ The recipe also handles missing values, converts categorical variables to dummy 
 
 ```{r}
 my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
-  # IDs
-  update_role(shot_id, game_id, team_id, new_role = "ID") %>%
   
-  # ---------------------------------------------------------
-  # FEATURE ENGINEERING (your additions)
-  # ---------------------------------------------------------
+  ## ---- Remove leakage / non-predictive identifiers ----
+  step_rm(shot_id, game_id, team_id, game_event_id, team_name) %>%
+  
+  ## ---- Basic feature engineering ----
+  # Time remaining in the period (seconds)
   step_mutate(
-    # Home vs Away
-    home = ifelse(grepl("vs\\.", matchup), "Home", "Away"),
-    
-    # Season short (last digit of second part)
-    season_short = as.integer(substr(sub(".*-", "", season), 2, 2)),
-    
-    # Game year
-    game_year = as.integer(substr(game_date, 1, 4)),
-    
-    # Numeric game index for time ordering
-    game_num = as.numeric(as.Date(game_date)),
-    
-    # Seconds remaining in the period
-    time_remaining = minutes_remaining * 60 + seconds_remaining,
-    
-    # Period to factor
-    period = factor(period)
+    time_remaining = minutes_remaining * 60 + seconds_remaining
   ) %>%
   
-  # Achilles and MVP indicators
+  # Home vs Away indicator from "matchup"
   step_mutate(
-    postachilles = ifelse(game_num > 1452, 1, 0),
-    mvp         = ifelse(game_num >= 909 & game_num <= 990, 1, 0)
-  ) %>% 
+    home = ifelse(str_detect(matchup, "vs"), 1, 0)
+  ) %>%
   
-  # ---------------------------------------------------------
-  # POLAR COORDINATES FOR SHOOTING LOCATION
-  # ---------------------------------------------------------
+  # Season start year (e.g. "2000-01" → 2000)
+  step_mutate(
+    season_start = as.integer(str_sub(season, 1, 4))
+  ) %>%
+  
+  ## ---- Date features ----
+  step_mutate(
+    game_month = month(game_date),
+    game_year  = year(game_date),
+    game_num   = as.numeric(as.Date(game_date))   # needed for postachilles / mvp
+  ) %>%
+  
+  ## ---- Polar coordinates + spatial features ----
   step_mutate(
     shot_distance = sqrt((loc_x / 10)^2 + (loc_y / 10)^2),
-    
-    # Safe angle computation: atan2 handles loc_x = 0 case automatically
-    angle = atan2(loc_y, loc_x)
+    angle         = atan2(loc_y, loc_x),
+    left_right    = ifelse(loc_x < 0, "Left", "Right"),
+    dist_bucket   = case_when(
+      shot_distance <= 5  ~ "0-5ft",
+      shot_distance <= 15 ~ "6-15ft",
+      shot_distance <= 24 ~ "16-24ft",
+      TRUE                ~ "25+ft"
+    ),
+    angle_quadrant = case_when(
+      angle >= -pi/4  & angle <=  pi/4   ~ "Center",
+      angle >   pi/4  & angle <= 3*pi/4  ~ "Left",
+      TRUE                               ~ "Right"
+    )
   ) %>%
   
-  # Drop raw columns we replaced
+  ## ---- Game-era / clutch context ----
+  step_mutate(
+    postachilles = ifelse(game_num > 1452, 1, 0),
+    mvp         = ifelse(game_num >= 909 & game_num <= 990, 1, 0),
+    clutch      = ifelse(time_remaining <= 24, 1, 0),
+    deep_clutch = ifelse(period == 4 & time_remaining <= 24, 1, 0)
+  ) %>%
+  
+  ## ---- Drop raw columns now replaced by engineered features ----
   step_rm(
-    game_event_id,
-    team_name,
+    game_date,
+    season,
     matchup,
     opponent,
-    shot_id,
-    game_id,
-    team_id,
-    game_date,
-    season
+    loc_x,
+    loc_y
   ) %>%
   
-  # ---------------------------------------------------------
-  # ORIGINAL RECIPE STEPS (these worked best for you)
-  # ---------------------------------------------------------
-  step_impute_mean(all_numeric_predictors()) %>%
-  step_impute_mode(all_nominal_predictors()) %>%
-  step_novel(all_nominal_predictors()) %>%
+  ## ---- Clean categorical variables ----
+  # Convert character → factor
+  step_string2factor(all_nominal_predictors()) %>%
+  
+  # One-hot encode 
   step_dummy(all_nominal_predictors()) %>%
-  step_zv(all_predictors()) %>%
-  step_center(all_numeric_predictors()) %>%
-  step_scale(all_numeric_predictors())
-
-
+  
+  ## ---- Handle missing values ----
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  ## ---- Normalize numeric predictors ----
+  step_normalize(all_numeric_predictors()) %>%
+  
+  ## ---- Remove zero-variance predictors ----
+  step_zv(all_predictors())
 
 
 shot_prep <- prep(my_recipe)
 train_ready <- juice(shot_prep)
 test_ready <- bake(shot_prep, new_data = test)
+```
+
+### Test recipes 
+
+The recipe above was not working to get my predictions as accurate as I was hoping for. So I resulted to a more simple version that made better predictions. In this recipe I took our leakage variables, adjusted basic features, normalized, and dummy encoded the variables.
+
+```{r}
+my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
+  
+  ## ---- Remove leakage / non-predictive identifiers ----
+step_rm(shot_id,game_id, team_id, game_event_id, team_name) %>%
+  
+  ## ---- Basic feature engineering ----
+# Time remaining in the period
+step_mutate(time_remaining = minutes_remaining * 60 + seconds_remaining) %>%
+  
+  # Home vs Away indicator from "matchup"
+  step_mutate(home = ifelse(str_detect(matchup, "vs"), 1, 0)) %>%
+  
+  # Extract season start year (e.g. "2000-01" → 2000)
+  step_mutate(season_start = as.integer(str_sub(season, 1, 4))) %>%
+  
+  ## ---- Date features ----
+step_mutate(
+  game_month = month(game_date),
+  game_year  = year(game_date)
+) %>%
+  step_rm(game_date) %>%  # remove raw date afterward
+  
+  ## ---- Clean categorical variables ----
+# Convert character → factor
+step_string2factor(all_nominal_predictors()) %>%
+  
+  # One-hot encode 
+  step_dummy(all_nominal_predictors()) %>%
+  
+  ## ---- Handle missing values ----
+step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  ## ---- Normalize numeric predictors ----
+step_normalize(all_numeric_predictors()) %>%
+  
+  ## ---- Remove zero-variance predictors ----
+step_zv(all_predictors()) 
 ```
 
 # RF Model (Tuned)
@@ -301,23 +358,26 @@ A baseline random forest model is also fit without tuning to compare against the
 Here, fixed values of mtry, min_n, and trees are chosen manually. The model is trained on the full training data and used to produce predictions for the test set.
 
 ```{r}
+prep_obj <- prep(my_recipe)
+train_ready <- juice(prep_obj)
+p <- ncol(train_ready) - 1  # number of predictors
+floor(sqrt(p))
+
+
 rf_spec <- rand_forest(
-  mtry  = 10,   # example: 20 predictors tried at each split
-  min_n = 8,    # example: minimum 5 observations per terminal node
-  trees = 500   # number of trees
+  mtry  = 20,   # better default than 10
+  min_n = 40,                # still reasonable
+  trees = 500              # stronger forest
 ) %>%
   set_mode("classification") %>%
-  set_engine("ranger", importance = "impurity")
+  set_engine("ranger", importance = "permutation")
 
-# 3) Workflow: recipe + model
 rf_wf <- workflow() %>%
   add_recipe(my_recipe) %>%
   add_model(rf_spec)
 
-# 4) Fit on full training data (NO tuning, NO CV)
 final_fit <- fit(rf_wf, data = train)
 
-# 5) Predict on the test set (no shot_made_flag there)
 test_prob  <- predict(final_fit, new_data = test, type = "prob")
 test_class <- predict(final_fit, new_data = test, type = "class")
 
@@ -329,11 +389,10 @@ test_preds <- bind_cols(
   )
 )
 
-
 submission <- test_preds %>%
   transmute(
     shot_id,
-    shot_made_flag = prob_made   # probability the shot was made
+    shot_made_flag = prob_made
   )
 
 write.csv(submission, "kobe-submission.csv", row.names = FALSE)
