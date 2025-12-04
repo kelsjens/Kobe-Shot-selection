@@ -1,5 +1,5 @@
 ---
-title: "Kobe Shot Selection"
+title: "Kobe Shot Selection Notebook"
 author: "Kelson Jensen"
 format: pdf
 editor: visual
