@@ -48,8 +48,20 @@ nrow(test)
 ```{r}
 
 my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
+  # IDs
   update_role(shot_id, game_id, team_id, new_role = "ID") %>%
+  
+  # Remove known non-predictive columns
   step_rm(game_event_id, team_name, matchup, opponent, shot_id, game_id, team_id) %>%
+  
+  # --- Safe feature engineering ---
+  step_mutate(
+    game_year = as.integer(substr(game_date, 1, 4)),
+    time_remaining = minutes_remaining * 60 + seconds_remaining
+  ) %>%
+  step_rm(game_date) %>%   # remove raw date (it would produce useless dummies)
+  
+  # --- Original recipe pieces that worked ---
   step_impute_mean(all_numeric_predictors()) %>%
   step_impute_mode(all_nominal_predictors()) %>%
   step_novel(all_nominal_predictors()) %>%
@@ -57,7 +69,6 @@ my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
   step_zv(all_predictors()) %>%
   step_center(all_numeric_predictors()) %>%
   step_scale(all_numeric_predictors())
-
 
 
 
@@ -77,7 +88,7 @@ train_ready <- juice(prep_obj)
 rf_spec <- rand_forest(
   mtry  = tune(),
   min_n = tune(),
-  trees = 200
+  trees = 500
 ) %>%
   set_mode("classification") %>%
   set_engine("ranger", importance = "impurity")
@@ -90,13 +101,13 @@ rf_wf <- workflow() %>%
 # 6) CV folds
 folds <- vfold_cv(train, v = 3, strata = shot_made_flag)
 
-# 7) Parameter ranges — THIS is the fix 👇
+# 7) Parameter ranges
 rf_params <- parameters(
   finalize(mtry(), train_ready),  # pass a 2D data frame, not a number
   min_n()
 )
 
-rf_grid <- grid_regular(rf_params, levels = 5)
+rf_grid <- grid_regular(rf_params, levels = 3)
 
 # 8) Tune
 tuned <- tune_grid(
@@ -123,4 +134,46 @@ test_preds <- bind_cols(
     pred_flag = test_class$.pred_class
   )
 )
+```
+
+# RF Not tuned
+
+```{r}
+rf_spec <- rand_forest(
+  mtry  = 10,   # example: 20 predictors tried at each split
+  min_n = 5,    # example: minimum 5 observations per terminal node
+  trees = 1000   # number of trees
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+# 3) Workflow: recipe + model
+rf_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(rf_spec)
+
+# 4) Fit on full training data (NO tuning, NO CV)
+final_fit <- fit(rf_wf, data = train)
+
+# 5) Predict on the test set (no shot_made_flag there)
+test_prob  <- predict(final_fit, new_data = test, type = "prob")
+test_class <- predict(final_fit, new_data = test, type = "class")
+
+test_preds <- bind_cols(
+  test %>% select(shot_id),
+  tibble(
+    prob_made = test_prob$.pred_made,
+    pred_flag = test_class$.pred_class
+  )
+)
+
+
+submission <- test_preds %>%
+  transmute(
+    shot_id,
+    shot_made_flag = prob_made   # probability the shot was made
+  )
+
+write.csv(submission, "kobe-submission.csv", row.names = FALSE)
+
 ```
