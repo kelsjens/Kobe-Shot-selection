@@ -5,6 +5,8 @@ format: pdf
 editor: visual
 ---
 
+
+
 # Intro
 
 This notebook builds machine learning models to predict whether Kobe Bryant made or missed each shot in the Kaggle *Kobe Bryant Shot Selection* competition. The goal is to use the rows that contain known shot outcomes to train several models and then generate predictions for the rows where the outcome is missing.
@@ -14,6 +16,8 @@ The workflow includes importing the dataset, splitting into training and test se
 ### Libraries
 
 These are all of the libraries I needed throughout the document.
+
+
 
 ```{r}
 library(tidyverse)
@@ -28,6 +32,8 @@ library(remotes)
 library(xgboost)
 ```
 
+
+
 ### Upload data
 
 In this section, the original dataset is loaded and separated into two parts:
@@ -37,6 +43,8 @@ In this section, the original dataset is loaded and separated into two parts:
 -   The **test set** consists of rows where shot_made_flag is missing and represents the data for which Kaggle expects predictions.
 
 The training data also recodes shot_made_flag into a factor with levels "missed" and "made" to support classification modeling.
+
+
 
 ```{r}
 # Load your data
@@ -58,6 +66,8 @@ nrow(test)
 
 ```
 
+
+
 # EDA 
 
 Several visualizations are used to understand Kobe's shooting tendencies:
@@ -73,6 +83,8 @@ Several visualizations are used to understand Kobe's shooting tendencies:
 -   A bar chart of shot success proportions across different shot zone ranges.
 
 These plots help reveal spatial patterns in shot outcomes and motivate feature engineering decisions
+
+
 
 ```{r}
 kobe <- train
@@ -114,6 +126,8 @@ ggplot(kobe, aes(x = shot_zone_range, fill = factor(shot_made_flag))) +
 
 ```
 
+
+
 # Recipe
 
 To improve model performance, several new variables are created based on basketball context and court geometry.
@@ -141,6 +155,8 @@ Key engineered features include:
     -    Shot angle using atan2 to correctly capture shooting direction.
 
 The recipe also handles missing values, converts categorical variables to dummy variables, removes zero-variance predictors, and standardizes numeric predictors.
+
+
 
 ```{r}
 my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
@@ -230,9 +246,13 @@ train_ready <- juice(shot_prep)
 test_ready <- bake(shot_prep, new_data = test)
 ```
 
+
+
 ### Test recipes 
 
 The recipe above was not working to get my predictions as accurate as I was hoping for. So I resulted to a more simple version that made better predictions. In this recipe I took our leakage variables, adjusted basic features, normalized, and dummy encoded the variables.
+
+
 
 ```{r}
 my_recipe <- recipe(shot_made_flag ~ ., data = train) %>%
@@ -275,6 +295,8 @@ step_normalize(all_numeric_predictors()) %>%
 step_zv(all_predictors()) 
 ```
 
+
+
 # RF Model (Tuned)
 
 A random forest classifier is built using the engineered features.\
@@ -287,6 +309,8 @@ Two hyperparameters are tuned using cross-validation:
 A small regular grid is used to keep computation light.\
 The best model is selected based on ROC AUC.\
 The tuned model is then fit to the entire training set and used to generate predictions for the test set.
+
+
 
 ```{r}
 rf_spec <- rand_forest(
@@ -306,13 +330,13 @@ rf_wf <- workflow() %>%
 folds <- vfold_cv(train, v = 3, strata = shot_made_flag)
 
 # 7) Simple tuning grid for mtry & min_n
-mtry_range  <- finalize(mtry (range = c(10, 40)))              
-min_n_range <- min_n(range = c(5, 30))                 
+mtry_range  <- finalize(mtry(), train_ready)              # based on processed predictors
+min_n_range <- min_n(range = c(5L, 20L))                  # small nodes
 
 rf_grid <- grid_regular(
   mtry_range,
   min_n_range,
-  levels = 3        
+  levels = 3           # 3 x 3 = 9 combos => cheap
 )
 
 # 8) Tune
@@ -352,10 +376,14 @@ submission <- test_preds %>%
 write.csv(submission, "kobe-submission-tuned-simple-rf.csv", row.names = FALSE)
 ```
 
+
+
 # RF Model Not tuned
 
 A baseline random forest model is also fit without tuning to compare against the tuned version.
 Here, fixed values of mtry, min_n, and trees are chosen manually. The model is trained on the full training data and used to produce predictions for the test set.
+
+
 
 ```{r}
 prep_obj <- prep(my_recipe)
@@ -399,6 +427,8 @@ write.csv(submission, "kobe-submission.csv", row.names = FALSE)
 
 ```
 
+
+
 # Penalized regression 
 
 A penalized logistic regression model is built using glmnet.\
@@ -412,6 +442,8 @@ A regular grid over both parameters is evaluated using cross-validation.\
 The best model is finalized and used to generate predictions.
 
 This model provides an interpretable linear alternative to the tree-based models.
+
+
 
 ```{r}
 log_spec <- logistic_reg(
@@ -471,6 +503,8 @@ submission <- test_preds %>%
 write.csv(submission, "submission_glmnet.csv", row.names = FALSE)
 ```
 
+
+
 # XGboost model
 
 An XGBoost gradient boosted tree model is trained using the engineered features. A simple but effective configuration is used rather than a full hyperparameter search:
@@ -486,6 +520,8 @@ An XGBoost gradient boosted tree model is trained using the engineered features.
 -    Feature sampling (mtry) of 0.8, treated as a proportion
 
 XGBoost often performs well on structured tabular data, and this model is used to generate final predictions for the competition.
+
+
 
 ```{r}
 xgb_spec <- boost_tree(
@@ -526,6 +562,8 @@ submission <- test_preds %>%
 write.csv(submission, "kobe-xgboost-simple.csv", row.names = FALSE)
 ```
 
+
+
 ### Prediction generation
 
 Each model generates predicted class probabilities for the test set.\
@@ -542,3 +580,4 @@ The file is written as a CSV and uploaded to Kaggle for scoring.
 This notebook explored several modeling techniques for predicting shot outcomes in the Kobe Bryant dataset.\
 Through EDA, feature engineering, random forest models, penalized regression, and XGBoost, we built and compared multiple approaches.\
 The final output is a set of predictions formatted for submission to the Kaggle competition.
+
